@@ -20,11 +20,11 @@ WARNINGS_BEFORE_MUTE = 3
 MUTE_MINUTES = 10
 BAN_AFTER_WARNINGS = 6
 
+# Keep this list conservative: automatic moderation should not punish normal chat.
 BANNED_PATTERNS = [
     r"(?:^|\s)@everyone(?:\s|$)",
     r"(?:^|\s)@here(?:\s|$)",
 ]
-
 URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 
 router = Router()
@@ -47,9 +47,11 @@ async def send_log(bot: Bot, text: str):
 
 
 async def notify_user(bot: Bot, user, action: str):
-    text = f"{user.first_name}, Вы получили «{action}» в чате «{CHAT_TITLE}»."
     try:
-        await bot.send_message(user.id, text)
+        await bot.send_message(
+            user.id,
+            f"{user.first_name}, Вы получили «{action}» в чате «{CHAT_TITLE}».",
+        )
     except Exception:
         pass
 
@@ -58,16 +60,59 @@ async def is_admin(message: Message):
     if not message.from_user:
         return False
     member = await message.chat.get_member(message.from_user.id)
-    return member.status in {
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.CREATOR,
-    }
+    return member.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
 
 
 async def target_from_reply(message: Message):
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user
     return None
+
+
+async def mute_target(message: Message, user, minutes: int, reason: str, notify=True):
+    until_date = int(time.time() + minutes * 60)
+    try:
+        await message.chat.restrict(
+            user.id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=until_date,
+        )
+    except Exception as exc:
+        await send_log(message.bot, f"❌ Не удалось выдать мут {user.id}: {exc}")
+        return False
+
+    if notify:
+        await notify_user(message.bot, user, "мут")
+    await send_log(
+        message.bot,
+        "🔇 МУТ\n\n"
+        f"👤 Участник: {get_name(user)}\n"
+        f"🆔 ID: {user.id}\n"
+        f"⏱ Срок: {minutes} минут\n"
+        f"📋 Причина: {reason}\n"
+        f"💬 Чат: {CHAT_TITLE}",
+    )
+    return True
+
+
+async def ban_target(message: Message, user, reason: str, notify=True):
+    try:
+        await message.chat.ban(user.id)
+    except Exception as exc:
+        await send_log(message.bot, f"❌ Не удалось выдать бан {user.id}: {exc}")
+        return False
+
+    if notify:
+        await notify_user(message.bot, user, "бан")
+    await send_log(
+        message.bot,
+        "🔨 БАН\n\n"
+        f"👤 Участник: {get_name(user)}\n"
+        f"🆔 ID: {user.id}\n"
+        f"📋 Причина: {reason}\n"
+        f"💬 Чат: {CHAT_TITLE}",
+    )
+    return True
 
 
 async def punish_warning(message: Message, reason: str):
@@ -85,7 +130,11 @@ async def punish_warning(message: Message, reason: str):
 
     if count >= BAN_AFTER_WARNINGS:
         warnings[user.id] = 0
-        await ban_user(message, reason=f"{reason}; {BAN_AFTER_WARNINGS} предупреждений")
+        await ban_target(
+            message,
+            user,
+            f"{reason}; {BAN_AFTER_WARNINGS} предупреждений",
+        )
         return
 
     await notify_user(message.bot, user, "нарушение")
@@ -100,55 +149,7 @@ async def punish_warning(message: Message, reason: str):
     )
 
     if count == WARNINGS_BEFORE_MUTE:
-        await mute_user(message, MUTE_MINUTES, "3 нарушения")
-
-
-async def mute_user(message: Message, minutes: int, reason: str):
-    user = message.from_user
-    if not user:
-        return
-
-    until_date = int(time.time() + minutes * 60)
-    permissions = ChatPermissions(can_send_messages=False)
-
-    try:
-        await message.chat.restrict(user.id, permissions=permissions, until_date=until_date)
-    except Exception as exc:
-        await send_log(message.bot, f"❌ Не удалось выдать мут пользователю {user.id}: {exc}")
-        return
-
-    await notify_user(message.bot, user, "мут")
-    await send_log(
-        message.bot,
-        "🔇 МУТ\n\n"
-        f"👤 Участник: {get_name(user)}\n"
-        f"🆔 ID: {user.id}\n"
-        f"⏱ Срок: {minutes} минут\n"
-        f"📋 Причина: {reason}\n"
-        f"💬 Чат: {CHAT_TITLE}",
-    )
-
-
-async def ban_user(message: Message, reason: str):
-    user = message.from_user
-    if not user:
-        return
-
-    try:
-        await message.chat.ban(user.id)
-    except Exception as exc:
-        await send_log(message.bot, f"❌ Не удалось выдать бан пользователю {user.id}: {exc}")
-        return
-
-    await notify_user(message.bot, user, "бан")
-    await send_log(
-        message.bot,
-        "🔨 БАН\n\n"
-        f"👤 Участник: {get_name(user)}\n"
-        f"🆔 ID: {user.id}\n"
-        f"📋 Причина: {reason}\n"
-        f"💬 Чат: {CHAT_TITLE}",
-    )
+        await mute_target(message, user, MUTE_MINUTES, "3 нарушения")
 
 
 @router.message(F.new_chat_members)
@@ -160,6 +161,27 @@ async def welcome(message: Message):
         )
 
 
+@router.message(Command("start"))
+async def start_command(message: Message):
+    await message.answer("🤖 GingerXYT Mod Bot активен.")
+
+
+@router.message(Command("help"))
+async def help_command(message: Message):
+    if await is_admin(message):
+        await message.answer(
+            "🛡️ Команды администратора:\n"
+            "/warn — предупреждение (ответом)\n"
+            "/warns — посмотреть предупреждения\n"
+            "/mute [минуты] — мут (ответом)\n"
+            "/unmute — снять мут (ответом)\n"
+            "/ban — бан (ответом)\n"
+            "/unban USER_ID — разбан"
+        )
+    else:
+        await message.answer("🤖 Бот следит за антифлудом и антиспамом.")
+
+
 @router.message(Command("warn"))
 async def manual_warn(message: Message):
     if not await is_admin(message):
@@ -168,9 +190,22 @@ async def manual_warn(message: Message):
     if not user:
         await message.answer("⚠️ Используй /warn ответом на сообщение участника.")
         return
+
     warnings[user.id] += 1
-    await message.answer(f"⚠️ {get_name(user)} получил предупреждение: {warnings[user.id]}/{BAN_AFTER_WARNINGS}")
-    await send_log(message.bot, f"⚠️ РУЧНОЕ ПРЕДУПРЕЖДЕНИЕ\n👤 {get_name(user)}\n🆔 {user.id}\n💬 {CHAT_TITLE}")
+    count = warnings[user.id]
+    await message.answer(f"⚠️ {get_name(user)}: {count}/{BAN_AFTER_WARNINGS}")
+    await notify_user(message.bot, user, "нарушение")
+    await send_log(
+        message.bot,
+        f"⚠️ РУЧНОЕ ПРЕДУПРЕЖДЕНИЕ\n👤 {get_name(user)}\n🆔 {user.id}\n"
+        f"⚠️ {count}/{BAN_AFTER_WARNINGS}\n💬 {CHAT_TITLE}",
+    )
+
+    if count == WARNINGS_BEFORE_MUTE:
+        await mute_target(message, user, MUTE_MINUTES, "3 ручных предупреждения")
+    elif count >= BAN_AFTER_WARNINGS:
+        warnings[user.id] = 0
+        await ban_target(message, user, "6 предупреждений")
 
 
 @router.message(Command("mute"))
@@ -181,18 +216,13 @@ async def manual_mute(message: Message):
     if not user:
         await message.answer("🔇 Используй /mute ответом на сообщение участника.")
         return
+
     parts = message.text.split()
     minutes = 10
     if len(parts) > 1 and parts[1].isdigit():
         minutes = max(1, min(int(parts[1]), 1440))
-    try:
-        await message.chat.restrict(user.id, permissions=ChatPermissions(can_send_messages=False), until_date=int(time.time() + minutes * 60))
-        await message.answer(f"🔇 {get_name(user)} получил мут на {minutes} мин.")
-        await notify_user(message.bot, user, "мут")
-        await send_log(message.bot, f"🔇 РУЧНОЙ МУТ\n👤 {get_name(user)}\n🆔 {user.id}\n⏱ {minutes} минут\n💬 {CHAT_TITLE}")
-    except Exception as exc:
-        await message.answer("❌ Не удалось выдать мут.")
-        await send_log(message.bot, f"❌ Ошибка ручного мута: {exc}")
+    await mute_target(message, user, minutes, "ручная модерация")
+    await message.answer(f"🔇 {get_name(user)}: мут на {minutes} мин.")
 
 
 @router.message(Command("unmute"))
@@ -203,6 +233,7 @@ async def manual_unmute(message: Message):
     if not user:
         await message.answer("🔊 Используй /unmute ответом на сообщение участника.")
         return
+
     permissions = ChatPermissions(
         can_send_messages=True,
         can_send_audios=True,
@@ -214,9 +245,7 @@ async def manual_unmute(message: Message):
         can_send_polls=True,
         can_send_other_messages=True,
         can_add_web_page_previews=True,
-        can_change_info=False,
         can_invite_users=True,
-        can_pin_messages=False,
     )
     try:
         await message.chat.restrict(user.id, permissions=permissions)
@@ -235,14 +264,8 @@ async def manual_ban(message: Message):
     if not user:
         await message.answer("🔨 Используй /ban ответом на сообщение участника.")
         return
-    try:
-        await message.chat.ban(user.id)
+    if await ban_target(message, user, "ручная модерация"):
         await message.answer(f"🔨 {get_name(user)} забанен.")
-        await notify_user(message.bot, user, "бан")
-        await send_log(message.bot, f"🔨 РУЧНОЙ БАН\n👤 {get_name(user)}\n🆔 {user.id}\n💬 {CHAT_TITLE}")
-    except Exception as exc:
-        await message.answer("❌ Не удалось выдать бан.")
-        await send_log(message.bot, f"❌ Ошибка ручного бана: {exc}")
 
 
 @router.message(Command("unban"))
@@ -287,12 +310,10 @@ async def moderation(message: Message):
             await punish_warning(message, "запрещённая конструкция")
             return
 
-    # Link spam: several URLs in one message are treated as spam.
     if len(URL_RE.findall(text)) >= 3:
         await punish_warning(message, "антиспам: слишком много ссылок")
         return
 
-    # Excessive caps: only trigger on longer messages with very high uppercase ratio.
     letters = [char for char in message.text if char.isalpha()]
     if len(letters) >= 12:
         upper_ratio = sum(char.isupper() for char in letters) / len(letters)
@@ -300,17 +321,14 @@ async def moderation(message: Message):
             await punish_warning(message, "антиспам: чрезмерный CAPS LOCK")
             return
 
-    # Anti-flood.
     times = message_times[user_id]
     times.append(now)
     while times and now - times[0] > FLOOD_WINDOW:
         times.popleft()
-
     if len(times) > FLOOD_LIMIT:
         await punish_warning(message, "антифлуд: слишком много сообщений")
         return
 
-    # Anti-spam: repeated identical messages.
     texts = recent_messages[user_id]
     texts.append((now, text))
     while texts and now - texts[0][0] > SPAM_WINDOW:
@@ -330,7 +348,6 @@ async def main():
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-
     await bot.delete_webhook(drop_pending_updates=True)
     print("🤖 GingerXYT Mod Bot запущен!")
     await dp.start_polling(bot)
